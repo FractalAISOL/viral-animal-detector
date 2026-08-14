@@ -6,12 +6,11 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import and_, text
 
 from app.db import (
-    SessionLocal, Post, EntityCluster, ClusterKey, ClusterAlias, Subreddit,
+    SessionLocal, Post, EntityCluster, ClusterKey, ClusterAlias, Subreddit, Alert,
 )
 from app.config import (
     JACCARD_THRESHOLD, PHASH_THRESHOLD, ENTITY_CREATION_THRESHOLD,
     CROSS_SUB_MIN_POSTS, CROSS_SUB_MIN_AS, CROSS_SUB_LEAD_AS,
-    ALERT_LEVEL_3,
 )
 from app import telegram
 
@@ -31,11 +30,15 @@ def _jaccard_similarity(title1: str, title2: str) -> float:
     # Weight proper nouns 2x
     weighted1 = set()
     for w in words1:
+        if not w:
+            continue
         weighted1.add(w.lower())
         if w[0].isupper() and len(w) > 1:
             weighted1.add(f"PROPER_{w.lower()}")
     weighted2 = set()
     for w in words2:
+        if not w:
+            continue
         weighted2.add(w.lower())
         if w[0].isupper() and len(w) > 1:
             weighted2.add(f"PROPER_{w.lower()}")
@@ -240,11 +243,18 @@ def _match_by_title_similarity(db, post: Post) -> int | None:
             best_cluster_id = rp.cluster_id
 
         # Auto-match on proper noun overlap
-        post_proper = {w for w in post.title.split() if w[0].isupper() and len(w) > 1}
-        rp_proper = {w for w in rp.title.split() if w[0].isupper() and len(w) > 1}
+        post_proper = {w for w in post.title.split() if w and w[0].isupper() and len(w) > 1}
+        rp_proper = {w for w in rp.title.split() if w and w[0].isupper() and len(w) > 1}
         common_proper = post_proper & rp_proper
         # Skip common words
-        common_proper -= {"The", "This", "That", "My", "Our", "His", "Her"}
+        common_proper -= {"The", "This", "That", "My", "Our", "His", "Her",
+                          "It", "In", "At", "On", "Of", "An", "To", "So",
+                          "No", "Or", "If", "Up", "As", "By", "We", "He",
+                          "She", "Its", "All", "But", "For", "Not", "Are",
+                          "Was", "One", "Two", "Has", "Had", "Can", "Did",
+                          "Got", "New", "Old", "Big", "How", "Why", "Who",
+                          "Just", "Now", "Here", "Very", "Much", "Even",
+                          "More", "Most", "Some", "Any", "Each", "Every"}
         if len(common_proper) >= 2:
             return rp.cluster_id
 
@@ -292,7 +302,7 @@ def _update_cluster_on_link(db, cluster_id: int, post: Post):
     """), {
         "score": post.current_score,
         "comments": post.current_comments,
-        "anomaly": post.anomaly_score,
+        "anomaly": post.anomaly_score or 0,
         "now": datetime.now(timezone.utc),
         "cid": cluster_id,
     })
@@ -395,7 +405,6 @@ async def check_cross_sub_alerts(db, cold_start_active: bool = False):
         msg = telegram.format_level3(cluster_dict, lead_dict)
         msg_id = await telegram.send_message(msg)
 
-        from app.db import Alert
         alert = Alert(
             alert_type="cluster",
             alert_level=3,

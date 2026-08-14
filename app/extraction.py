@@ -257,6 +257,19 @@ _SUFFIX_MAP = {
 }
 
 
+def _word_match(term: str, text: str) -> bool:
+    """Check if term appears as a complete word/phrase in text (not as a substring)."""
+    idx = text.find(term)
+    while idx != -1:
+        before_ok = idx == 0 or not text[idx - 1].isalpha()
+        after_idx = idx + len(term)
+        after_ok = after_idx >= len(text) or not text[after_idx].isalpha()
+        if before_ok and after_ok:
+            return True
+        idx = text.find(term, idx + 1)
+    return False
+
+
 def _normalize_term(word: str) -> str:
     """Simple suffix stripping for matching."""
     w = word.lower()
@@ -278,14 +291,14 @@ def detect_species(title: str, subreddit: str) -> tuple[str, str] | None:
 
     # Try multi-word matches first (longest first)
     for term in _species_terms_sorted:
-        if term in title_lower:
+        if _word_match(term, title_lower):
             # Check ambiguity
             if term in AMBIGUOUS_TERMS:
                 if sub_lower in NON_ANIMAL_SUBREDDITS:
                     continue
                 if sub_lower not in ANIMAL_SUBREDDITS:
                     # General sub — need second animal signal
-                    other_terms = [t for t in SPECIES_MAP if t != term and t in title_lower]
+                    other_terms = [t for t in SPECIES_MAP if t != term and _word_match(t, title_lower)]
                     animal_keywords = ["pet", "rescue", "zoo", "animal", "wild", "adopted", "stray"]
                     has_signal = other_terms or any(kw in title_lower for kw in animal_keywords)
                     if not has_signal:

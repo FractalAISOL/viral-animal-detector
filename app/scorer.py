@@ -1,5 +1,6 @@
 """Scoring engine — computes anomaly scores and triggers alerts."""
 
+import asyncio
 import math
 import logging
 from datetime import datetime, timezone, timedelta
@@ -8,7 +9,7 @@ from sqlalchemy import and_, text
 
 from app.db import (
     SessionLocal, Post, ScoreHistory, SubredditBaseline, VelocityBaseline,
-    EntityCluster, Alert, FlaggedAuthor,
+    EntityCluster, Alert, FlaggedAuthor, Subreddit,
 )
 from app.baselines import (
     get_time_bucket, get_day_type, get_velocity_bracket, add_baseline_sample,
@@ -67,10 +68,10 @@ class Scorer:
 
             for post in due_posts:
                 try:
-                    await self._score_post(db, post, now)
+                    with db.begin_nested():
+                        await self._score_post(db, post, now)
                 except Exception as e:
                     logger.error(f"Error scoring post {post.reddit_id}: {e}")
-                    db.rollback()
 
             # Deactivate old posts (25hr buffer past final 24hr scoring)
             cutoff = now - timedelta(hours=POST_DEACTIVATE_HOURS)
@@ -193,6 +194,10 @@ class Scorer:
         )
         db.add(history)
 
+        # Capture old values BEFORE updating post (needed for cluster delta)
+        old_score = post.current_score or 0
+        old_comments = post.current_comments or 0
+
         # Update post
         post.current_score = score
         post.current_comments = comments
@@ -219,8 +224,8 @@ class Scorer:
                     last_post_at = GREATEST(last_post_at, :now)
                 WHERE id = :cid
             """), {
-                "score_delta": score - (post.current_score or 0),
-                "comment_delta": comments - (post.current_comments or 0),
+                "score_delta": score - old_score,
+                "comment_delta": comments - old_comments,
                 "anomaly": anomaly_score,
                 "now": now,
                 "cid": post.cluster_id,
@@ -305,7 +310,6 @@ class Scorer:
                 return
 
         # Get subreddit name for formatting
-        from app.db import Subreddit
         sub = db.query(Subreddit).filter(Subreddit.id == post.subreddit_id).first()
         sub_name = sub.name if sub else "unknown"
 
@@ -382,6 +386,3 @@ class Scorer:
         db.flush()
         logger.info(f"Alert L{new_level}: {post.title[:60]} (AS={anomaly_score:.1f})")
 
-
-# Need asyncio import for to_thread
-import asyncio

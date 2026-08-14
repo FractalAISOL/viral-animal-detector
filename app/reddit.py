@@ -90,7 +90,7 @@ def _submission_to_dict(submission, subreddit_name: str) -> dict:
             thumbnail_url = submission.preview["images"][0]["source"]["url"]
         except (KeyError, IndexError):
             pass
-    if not thumbnail_url and hasattr(submission, "thumbnail") and submission.thumbnail.startswith("http"):
+    if not thumbnail_url and hasattr(submission, "thumbnail") and submission.thumbnail and submission.thumbnail.startswith("http"):
         thumbnail_url = submission.thumbnail
 
     return {
@@ -101,7 +101,7 @@ def _submission_to_dict(submission, subreddit_name: str) -> dict:
         "url": submission.url,
         "permalink": submission.permalink,
         "post_hint": getattr(submission, "post_hint", None),
-        "flair": submission.link_flair_text,
+        "flair": getattr(submission, "link_flair_text", None),
         "created_utc": datetime.fromtimestamp(submission.created_utc, tz=timezone.utc),
         "is_crosspost": is_crosspost,
         "crosspost_parent": crosspost_parent,

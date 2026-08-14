@@ -121,6 +121,10 @@ class Poller:
             if reddit_id in self.seen_ids:
                 continue
             self.seen_ids.add(reddit_id)
+            # Cap seen_ids to prevent unbounded memory growth
+            if len(self.seen_ids) > 50000:
+                # Evict arbitrary half (sets are unordered; dupes hit PK guard)
+                self.seen_ids = set(list(self.seen_ids)[:25000])
             self._stats["total_polled"] += 1
 
             # Minimum score gate

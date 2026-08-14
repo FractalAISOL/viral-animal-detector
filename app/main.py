@@ -3,11 +3,9 @@
 import asyncio
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from app.config import (
-    TIER1_INTERVAL, DIGEST_INTERVAL_HOURS, NEWS_INTERVAL,
-)
+from app.config import DIGEST_INTERVAL_HOURS
 from app.reddit import create_reddit_client
 from app.poller import Poller
 from app.scorer import Scorer
@@ -36,8 +34,8 @@ async def main():
     try:
         reddit = create_reddit_client()
         # Verify connection
-        reddit.user.me()
-        logger.info(f"Reddit connected as u/{reddit.user.me()}")
+        me = reddit.user.me()
+        logger.info(f"Reddit connected as u/{me}")
     except Exception as e:
         logger.error(f"Reddit connection failed: {e}")
         await telegram.send_message(
@@ -59,7 +57,7 @@ async def main():
     scorer = Scorer(reddit, cold_start_active=True)
 
     # Run all tasks concurrently
-    await asyncio.gather(
+    results = await asyncio.gather(
         poller.start(),
         _scoring_loop(scorer),
         _cross_sub_loop(scorer),
@@ -69,7 +67,12 @@ async def main():
         _daily_cleanup_loop(),
         _daily_summary_loop(),
         _cold_start_monitor(scorer),
+        return_exceptions=True,
     )
+    # Log any task failures
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error(f"Task {i} failed: {result}")
 
 
 async def _scoring_loop(scorer: Scorer):
@@ -144,7 +147,6 @@ async def _daily_cleanup_loop():
         # Calculate seconds until next 03:00 UTC
         target = now.replace(hour=3, minute=0, second=0, microsecond=0)
         if now >= target:
-            from datetime import timedelta
             target += timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
         await asyncio.sleep(wait_seconds)
@@ -160,7 +162,6 @@ async def _daily_summary_loop():
         now = datetime.now(timezone.utc)
         target = now.replace(hour=9, minute=0, second=0, microsecond=0)
         if now >= target:
-            from datetime import timedelta
             target += timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
         await asyncio.sleep(wait_seconds)

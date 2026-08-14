@@ -9,6 +9,7 @@ from app.db import (
     SessionLocal, Post, EntityCluster, BaselineSample, ScoreHistory,
     HealthCheck, Alert, Subreddit,
 )
+from app.config import ALERT_LEVEL_1, ALERT_LEVEL_2
 from app import telegram
 
 logger = logging.getLogger(__name__)
@@ -107,15 +108,13 @@ async def send_digest():
     """Send Level 1 digest every 4 hours."""
     db = SessionLocal()
     try:
-        from app.config import ALERT_LEVEL_1, ALERT_LEVEL_2
-
         # Find posts at L1 that haven't been included in a digest yet
         cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
         digest_posts = db.query(Post).filter(
             and_(
                 Post.anomaly_score >= ALERT_LEVEL_1,
                 Post.anomaly_score < ALERT_LEVEL_2,
-                Post.alert_level <= 1,
+                Post.alert_level < 1,
                 Post.last_scored_at >= cutoff,
                 Post.tracking_active == True,
             )
@@ -128,6 +127,11 @@ async def send_digest():
         post_dicts = []
         for p in digest_posts:
             sub = db.query(Subreddit).filter(Subreddit.id == p.subreddit_id).first()
+            # Fetch latest velocity from score history
+            latest_sh = db.query(ScoreHistory).filter(
+                ScoreHistory.post_id == p.reddit_id
+            ).order_by(ScoreHistory.recorded_at.desc()).first()
+            velocity = latest_sh.score_velocity if latest_sh and latest_sh.score_velocity else 0
             post_dicts.append({
                 "reddit_id": p.reddit_id,
                 "subreddit": sub.name if sub else "unknown",
@@ -135,7 +139,7 @@ async def send_digest():
                 "score": p.current_score,
                 "num_comments": p.current_comments,
                 "anomaly_score": p.anomaly_score,
-                "velocity": 0,
+                "velocity": velocity,
                 "upvote_ratio": p.upvote_ratio,
             })
 
