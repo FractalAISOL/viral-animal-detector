@@ -1,6 +1,7 @@
+"""Telegram alert formatting and sending."""
+
 import logging
 import httpx
-from datetime import datetime, timezone
 
 from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
@@ -32,80 +33,91 @@ async def send_message(text: str, parse_mode: str = "HTML") -> int | None:
         return None
 
 
-def format_level1_digest(posts: list[dict]) -> str:
+def format_level1_digest(clusters: list[dict]) -> str:
     """Format Level 1 digest alert (batched every 4hrs)."""
-    lines = ["<b>ANIMAL RADAR - 4h Digest</b>\n"]
-    lines.append(f"{len(posts)} posts above baseline:\n")
-    for i, p in enumerate(posts[:10], 1):
+    lines = ["<b>VIRAL RADAR - 4h Digest</b>\n"]
+    lines.append(f"{len(clusters)} entities gaining momentum:\n")
+    for i, c in enumerate(clusters[:10], 1):
+        name = c.get("entity_name") or "Unknown"
+        etype = c.get("entity_type") or ""
+        mentions = c.get("mention_count", 0)
+        subs = c.get("sub_count", 0)
+        momentum = c.get("momentum_score", 0)
         lines.append(
-            f"{i}. r/{p['subreddit']} - \"{p['title'][:60]}\"\n"
-            f"   Score: {p['score']:,} (AS: {p['anomaly_score']:.1f}) | "
-            f"{p['num_comments']} comments\n"
-            f"   Velocity: +{p.get('velocity', 0):.0f}/hr | "
-            f"Ratio: {p.get('upvote_ratio', 0):.2f}\n"
-            f"   https://redd.it/{p['reddit_id']}\n"
+            f"{i}. <b>{name}</b>"
+            f"{f' ({etype})' if etype else ''}\n"
+            f"   {mentions} mentions / {subs} subs | "
+            f"Momentum: {momentum:.1f}\n"
         )
+        if c.get("lead_url"):
+            lines.append(f"   {c['lead_url']}\n")
     return "\n".join(lines)
 
 
-def format_level2(post: dict, cluster: dict | None = None) -> str:
-    """Format Level 2 immediate alert."""
+def format_level2(cluster: dict, item: dict | None = None) -> str:
+    """Format Level 2 immediate alert — entity trending."""
+    name = cluster.get("entity_name") or "Unknown"
+    etype = cluster.get("entity_type") or ""
+    mentions = cluster.get("mention_count", 0)
+    subs = cluster.get("sub_count", 0)
+    sources = cluster.get("source_count", 0)
+    momentum = cluster.get("momentum_score", 0)
+
     lines = [
-        f"<b>TRENDING - r/{post['subreddit']}</b>\n",
-        f"\"{post['title'][:80]}\"\n"
-        f"Score: {post['score']:,} (AS: {post['anomaly_score']:.1f}) | "
-        f"{post['num_comments']} comments\n"
-        f"Velocity: +{post.get('velocity', 0):.0f}/hr | "
-        f"Ratio: {post.get('upvote_ratio', 0):.2f}\n",
+        f"<b>TRENDING{f' ({etype})' if etype else ''}</b>\n",
+        f"<b>{name}</b>\n"
+        f"{mentions} mentions / {subs} subs / {sources} sources\n"
+        f"Momentum: {momentum:.1f}\n",
     ]
-    if cluster:
-        cross = cluster.get("sub_count", 0)
-        if cross > 1:
-            lines.append(f"Cross-posts: {cross} subs\n")
-        entity_parts = []
-        if cluster.get("species"):
-            entity_parts.append(cluster["species"])
-        if cluster.get("location"):
-            entity_parts.append(cluster["location"])
-        if entity_parts:
-            total = cluster.get("total_score", 0)
-            lines.append(
-                f"Entity: {' / '.join(entity_parts)} "
-                f"({cluster.get('post_count', 0)} posts, {total:,} total)\n"
-            )
-    lines.append(f"\nhttps://redd.it/{post['reddit_id']}")
+
+    yt_views = cluster.get("youtube_views", 0)
+    if yt_views > 0:
+        lines.append(f"YouTube: {yt_views:,} views ({cluster.get('youtube_videos', 0)} videos)\n")
+
+    if item:
+        sub = item.get("subreddit", "")
+        source = item.get("source_type", "")
+        title = item.get("title", "")[:80]
+        lines.append(f"\nLead: \"{title}\"\n")
+        if sub:
+            lines.append(f"r/{sub}")
+        elif source:
+            lines.append(f"Source: {source}")
+        url = item.get("url", "")
+        if url:
+            lines.append(f"\n{url}")
+
     return "\n".join(lines)
 
 
-def format_level3(cluster: dict, lead_post: dict) -> str:
+def format_level3(cluster: dict, item: dict | None = None) -> str:
     """Format Level 3 viral breakout alert."""
+    name = cluster.get("entity_name") or "Unknown"
+    etype = cluster.get("entity_type") or ""
+    mentions = cluster.get("mention_count", 0)
+    subs = cluster.get("sub_count", 0)
+    sources = cluster.get("source_count", 0)
+    momentum = cluster.get("momentum_score", 0)
+
     lines = [
         "<b>*** VIRAL BREAKOUT ***</b>\n",
+        f"<b>{name}</b>"
+        f"{f' ({etype})' if etype else ''}\n",
+        f"{mentions} mentions / {subs} subs / {sources} sources\n"
+        f"Momentum: {momentum:.1f}\n",
     ]
-    name = cluster.get("animal_name") or cluster.get("species") or "Unknown"
-    lines.append(
-        f"\"{name}\" - {cluster['post_count']} posts / "
-        f"{cluster.get('sub_count', 0)} subs\n"
-    )
-    lines.append(
-        f"Lead: r/{lead_post['subreddit']} - {lead_post['score']:,} score "
-        f"(AS: {lead_post['anomaly_score']:.1f})\n"
-        f"Total: {cluster['total_score']:,} across "
-        f"{cluster.get('sub_count', 0)} subs | "
-        f"+{lead_post.get('velocity', 0):.0f}/hr\n"
-    )
-    if cluster.get("top_archetype"):
-        lines.append(f"Archetype: {cluster['top_archetype']}\n")
-    entity_parts = []
-    if cluster.get("species"):
-        entity_parts.append(cluster["species"])
-    if cluster.get("location"):
-        entity_parts.append(cluster["location"])
-    if cluster.get("animal_name"):
-        entity_parts.append(f'"{cluster["animal_name"]}"')
-    if entity_parts:
-        lines.append(f"Entity: {' / '.join(entity_parts)}\n")
-    lines.append(f"\nhttps://redd.it/{lead_post['reddit_id']}")
+
+    yt_views = cluster.get("youtube_views", 0)
+    if yt_views > 0:
+        lines.append(f"YouTube: {yt_views:,} views ({cluster.get('youtube_videos', 0)} videos)\n")
+
+    if item:
+        title = item.get("title", "")[:80]
+        lines.append(f"\nLead: \"{title}\"")
+        url = item.get("url", "")
+        if url:
+            lines.append(f"\n{url}")
+
     return "\n".join(lines)
 
 

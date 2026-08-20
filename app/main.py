@@ -1,16 +1,16 @@
-"""Main pipeline orchestrator — single-writer architecture."""
+"""Main pipeline orchestrator — multi-source viral moment detector."""
 
 import asyncio
 import logging
 import sys
 from datetime import datetime, timezone, timedelta
 
-from app.config import DIGEST_INTERVAL_HOURS
-from app.reddit import create_reddit_client
-from app.poller import Poller
+from app.config import (
+    SCORING_INTERVAL, GEMINI_CLUSTER_INTERVAL, DIGEST_INTERVAL_HOURS,
+)
+from app.discovery import Discovery
 from app.scorer import Scorer
-from app.baselines import recompute_baselines, check_cold_start_complete
-from app.entity import check_cross_sub_alerts
+from app.entity import run_gemini_clustering
 from app.cleanup import (
     run_daily_cleanup, send_digest, record_heartbeat, send_daily_summary,
 )
@@ -27,97 +27,67 @@ logger = logging.getLogger(__name__)
 
 
 async def main():
-    """Main entry point — runs the single-writer pipeline."""
-    logger.info("Viral Animal Momentum Detector starting...")
-
-    # Initialize Reddit client
-    try:
-        reddit = create_reddit_client()
-        # Verify connection
-        me = reddit.user.me()
-        logger.info(f"Reddit connected as u/{me}")
-    except Exception as e:
-        logger.error(f"Reddit connection failed: {e}")
-        await telegram.send_message(
-            telegram.format_system_message(f"STARTUP FAILED: Reddit connection error: {e}")
-        )
-        return
+    """Main entry point — runs the multi-source pipeline."""
+    logger.info("Viral Moment Detector starting...")
 
     # Send startup notification
     await telegram.send_message(
         telegram.format_system_message(
-            "Viral Animal Detector started.\n"
-            "Cold start mode: collecting baselines for 48 hours.\n"
-            "No alerts will be sent during this period."
+            "Viral Moment Detector started.\n"
+            "Sources: Reddit RSS + Hacker News + YouTube + Gemini\n"
+            "Cold start: collecting data for 1 hour before enabling alerts."
         )
     )
 
     # Initialize components
-    poller = Poller(reddit)
-    scorer = Scorer(reddit, cold_start_active=True)
+    discovery = Discovery()
+    scorer = Scorer()
 
     # Run all tasks concurrently
     results = await asyncio.gather(
-        poller.start(),
+        discovery.start(),
         _scoring_loop(scorer),
-        _cross_sub_loop(scorer),
-        _baseline_loop(),
+        _gemini_cluster_loop(),
         _digest_loop(),
-        _heartbeat_loop(poller),
+        _heartbeat_loop(discovery),
         _daily_cleanup_loop(),
         _daily_summary_loop(),
         _cold_start_monitor(scorer),
         return_exceptions=True,
     )
-    # Log any task failures
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             logger.error(f"Task {i} failed: {result}")
 
 
 async def _scoring_loop(scorer: Scorer):
-    """Run scoring every 60 seconds."""
+    """Run momentum scoring every 2 minutes."""
     while True:
         try:
             await scorer.run_scoring_pass()
         except Exception as e:
             logger.error(f"Scoring loop error: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(SCORING_INTERVAL)
 
 
-async def _cross_sub_loop(scorer: Scorer):
-    """Check cross-sub signals every 5 minutes."""
+async def _gemini_cluster_loop():
+    """Run Gemini semantic clustering every 5 minutes."""
+    # Initial delay to accumulate some items first
+    await asyncio.sleep(120)
     while True:
         try:
             db = SessionLocal()
             try:
-                await check_cross_sub_alerts(db, scorer.cold_start_active)
+                await run_gemini_clustering(db)
                 db.commit()
             except Exception as e:
                 db.rollback()
-                logger.error(f"Cross-sub check error: {e}")
+                logger.error(f"Gemini clustering error: {e}")
             finally:
                 db.close()
         except Exception as e:
-            logger.error(f"Cross-sub loop error: {e}")
-        await asyncio.sleep(300)
-
-
-async def _baseline_loop():
-    """Recompute baselines every hour."""
-    while True:
-        try:
-            db = SessionLocal()
-            try:
-                recompute_baselines(db)
-            except Exception as e:
-                db.rollback()
-                logger.error(f"Baseline recompute error: {e}")
-            finally:
-                db.close()
-        except Exception as e:
-            logger.error(f"Baseline loop error: {e}")
-        await asyncio.sleep(3600)
+            logger.error(f"Gemini loop error: {e}")
+        await asyncio.sleep(GEMINI_CLUSTER_INTERVAL)
 
 
 async def _digest_loop():
@@ -130,11 +100,11 @@ async def _digest_loop():
             logger.error(f"Digest error: {e}")
 
 
-async def _heartbeat_loop(poller: Poller):
+async def _heartbeat_loop(discovery: Discovery):
     """Record heartbeat every 10 minutes."""
     while True:
         try:
-            await record_heartbeat(poller.get_stats())
+            await record_heartbeat(discovery.get_stats())
         except Exception as e:
             logger.error(f"Heartbeat error: {e}")
         await asyncio.sleep(600)
@@ -144,7 +114,6 @@ async def _daily_cleanup_loop():
     """Run cleanup daily at 03:00 UTC."""
     while True:
         now = datetime.now(timezone.utc)
-        # Calculate seconds until next 03:00 UTC
         target = now.replace(hour=3, minute=0, second=0, microsecond=0)
         if now >= target:
             target += timedelta(days=1)
@@ -172,26 +141,15 @@ async def _daily_summary_loop():
 
 
 async def _cold_start_monitor(scorer: Scorer):
-    """Monitor cold start status and activate alerts when ready."""
-    while scorer.cold_start_active:
-        await asyncio.sleep(600)  # Check every 10 minutes
-        try:
-            db = SessionLocal()
-            try:
-                ready = await check_cold_start_complete(db)
-                if ready:
-                    scorer.cold_start_active = False
-                    logger.info("Cold start complete — alerts activated")
-                    await telegram.send_message(
-                        telegram.format_system_message(
-                            "Baselines established. Monitoring active.\n"
-                            "Alerts are now enabled."
-                        )
-                    )
-            finally:
-                db.close()
-        except Exception as e:
-            logger.error(f"Cold start monitor error: {e}")
+    """Disable cold start after 1 hour of data collection."""
+    await asyncio.sleep(3600)  # 1 hour
+    scorer.cold_start_active = False
+    logger.info("Cold start complete — alerts enabled")
+    await telegram.send_message(
+        telegram.format_system_message(
+            "Cold start complete. Monitoring active.\nAlerts are now enabled."
+        )
+    )
 
 
 if __name__ == "__main__":

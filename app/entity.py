@@ -1,24 +1,21 @@
-"""Entity clustering — matches posts to entity clusters and detects cross-sub signals."""
+"""Entity clustering — matches items to entity clusters using fast heuristics + Gemini."""
 
 import logging
 from datetime import datetime, timezone, timedelta
+from collections import Counter
 
 from sqlalchemy import and_, text
 
 from app.db import (
-    SessionLocal, Post, EntityCluster, ClusterKey, ClusterAlias, Subreddit, Alert,
+    SessionLocal, Item, EntityCluster, ClusterKey, ClusterAlias,
 )
-from app.config import (
-    JACCARD_THRESHOLD, PHASH_THRESHOLD, ENTITY_CREATION_THRESHOLD,
-    CROSS_SUB_MIN_POSTS, CROSS_SUB_MIN_AS, CROSS_SUB_LEAD_AS,
-)
-from app import telegram
+from app.config import JACCARD_THRESHOLD, ENTITY_CREATION_MIN_MENTIONS
+from app import gemini_client
 
 logger = logging.getLogger(__name__)
 
 
 def _normalize_name(name: str) -> str:
-    """Normalize a name for cluster key matching."""
     return name.lower().strip().replace(" ", "_")
 
 
@@ -27,7 +24,6 @@ def _jaccard_similarity(title1: str, title2: str) -> float:
     words1 = set(title1.split())
     words2 = set(title2.split())
 
-    # Weight proper nouns 2x
     weighted1 = set()
     for w in words1:
         if not w:
@@ -50,213 +46,85 @@ def _jaccard_similarity(title1: str, title2: str) -> float:
     return len(intersection) / len(union)
 
 
-def _hamming_distance(hash1: int, hash2: int) -> int:
-    """Compute Hamming distance between two perceptual hashes."""
-    return bin(hash1 ^ hash2).count("1")
+# Common title words to skip in proper noun matching
+_COMMON_WORDS = {
+    "The", "This", "That", "My", "Our", "His", "Her", "It", "In", "At",
+    "On", "Of", "An", "To", "So", "No", "Or", "If", "Up", "As", "By",
+    "We", "He", "She", "Its", "All", "But", "For", "Not", "Are", "Was",
+    "One", "Two", "Has", "Had", "Can", "Did", "Got", "New", "Old", "Big",
+    "How", "Why", "Who", "Just", "Now", "Here", "Very", "Much", "Even",
+    "More", "Most", "Some", "Any", "Each", "Every", "After", "Before",
+    "About", "With", "From", "What", "When", "Where", "Which", "While",
+    "First", "Last", "Next", "Only", "Just", "Over", "Into", "Back",
+    "Down", "Well", "Also", "Than", "Then", "Like", "Will", "Been",
+    "Would", "Could", "Should", "Said", "Made", "Found", "Know",
+}
 
 
-def _build_known_entities(db) -> dict[str, tuple[int, str, str]]:
+def match_or_create_entity_fast(db, item: Item):
     """
-    Build known_entities lookup from entity_clusters.
-    Returns: {lowercase_name: (cluster_id, species, location)}
+    Fast entity matching at ingestion time.
+    Uses Jaccard similarity + proper noun overlap.
+    Gemini clustering runs separately in batch.
     """
-    clusters = db.query(EntityCluster).filter(
-        and_(
-            EntityCluster.animal_name.isnot(None),
-            EntityCluster.status.in_(["active", "cooling"]),
-        )
-    ).all()
-
-    known = {}
-    for c in clusters:
-        known[c.animal_name.lower()] = (c.id, c.species, c.location)
-        # Also add aliases
-        for alias in c.aliases:
-            known[alias.alias.lower()] = (c.id, c.species, c.location)
-
-    return known
-
-
-def match_or_create_entity(db, post: Post, extraction: dict):
-    """
-    Match a post to an existing entity cluster or create a new one.
-    Called during post ingestion.
-    """
-    species = extraction.get("species")
-    name = extraction.get("name")
-    location = extraction.get("location")
-    narrative_score = extraction.get("narrative_score", 0)
-
-    # 1. Check known entities by name first
-    if name:
-        known = _build_known_entities(db)
-        name_lower = name.lower()
-        if name_lower in known:
-            cluster_id, k_species, k_location = known[name_lower]
-            post.cluster_id = cluster_id
-            # Inherit species/location if not extracted
-            if not species and k_species:
-                post.extracted_species = k_species
-            if not location and k_location:
-                post.extracted_location = k_location
-            _update_cluster_on_link(db, cluster_id, post)
-            return
-
-    # 2. Check cluster_keys table
-    cluster_id = _match_by_cluster_keys(db, name, species, location, post)
-    if cluster_id:
-        post.cluster_id = cluster_id
-        _update_cluster_on_link(db, cluster_id, post)
-        return
-
-    # 3. Cross-sub detection: crosspost_parent
-    if post.crosspost_parent:
-        parent = db.query(Post).filter(
-            Post.reddit_id == post.crosspost_parent
-        ).first()
-        if parent and parent.cluster_id:
-            post.cluster_id = parent.cluster_id
-            _update_cluster_on_link(db, parent.cluster_id, post)
-            return
-
-    # 4. Cross-sub detection: title Jaccard similarity
-    cluster_id = _match_by_title_similarity(db, post)
-    if cluster_id:
-        post.cluster_id = cluster_id
-        _update_cluster_on_link(db, cluster_id, post)
-        return
-
-    # 5. Cross-sub detection: pHash
-    if post.image_hash:
-        cluster_id = _match_by_phash(db, post)
-        if cluster_id:
-            post.cluster_id = cluster_id
-            _update_cluster_on_link(db, cluster_id, post)
-            return
-
-    # 6. No match — create new entity if criteria met
-    if narrative_score >= ENTITY_CREATION_THRESHOLD and (species or name):
-        cluster = EntityCluster(
-            animal_name=name,
-            species=species,
-            location=location,
-            post_count=1,
-            total_score=post.current_score,
-            total_comments=post.current_comments,
-            top_archetype=extraction.get("top_archetype"),
-        )
-        db.add(cluster)
-        db.flush()  # Get cluster.id
-
-        post.cluster_id = cluster.id
-
-        # Add cluster keys
-        if name:
-            _add_cluster_key(db, cluster.id, "name", f"name:{_normalize_name(name)}")
-            # Add alias
-            db.add(ClusterAlias(
-                cluster_id=cluster.id, alias=name.lower(), source="title_extraction"
-            ))
-
-        if species and location:
-            _add_cluster_key(
-                db, cluster.id, "species_location",
-                f"species_location:{species.lower()}:{location.lower()}"
-            )
-
-        sub = db.query(Subreddit).filter(Subreddit.id == post.subreddit_id).first()
-        if species and sub:
-            _add_cluster_key(
-                db, cluster.id, "species_sub",
-                f"species_sub:{species.lower()}:{sub.name.lower()}"
-            )
-
-        logger.info(f"New entity: {name or species} / {location or 'unknown'}")
-
-
-def _match_by_cluster_keys(db, name, species, location, post) -> int | None:
-    """Try to match by cluster key lookup."""
-    # Try name key
-    if name:
+    # 1. Check cluster_keys by extracted entity name
+    if item.extracted_entity:
         key = db.query(ClusterKey).filter(
             and_(
                 ClusterKey.key_type == "name",
-                ClusterKey.key_value == f"name:{_normalize_name(name)}",
+                ClusterKey.key_value == f"name:{_normalize_name(item.extracted_entity)}",
             )
         ).first()
         if key:
-            return key.cluster_id
+            item.cluster_id = key.cluster_id
+            _update_cluster_on_link(db, key.cluster_id)
+            return
 
-    # Try species+location key
-    if species and location:
-        key = db.query(ClusterKey).filter(
-            and_(
-                ClusterKey.key_type == "species_location",
-                ClusterKey.key_value == f"species_location:{species.lower()}:{location.lower()}",
-            )
+        # Check aliases
+        alias = db.query(ClusterAlias).filter(
+            ClusterAlias.alias == item.extracted_entity.lower()
         ).first()
-        if key:
-            return key.cluster_id
+        if alias:
+            item.cluster_id = alias.cluster_id
+            _update_cluster_on_link(db, alias.cluster_id)
+            return
 
-    # Try species+sub key (only within 24hrs)
-    sub = db.query(Subreddit).filter(Subreddit.id == post.subreddit_id).first()
-    if species and sub:
-        key = db.query(ClusterKey).filter(
-            and_(
-                ClusterKey.key_type == "species_sub",
-                ClusterKey.key_value == f"species_sub:{species.lower()}:{sub.name.lower()}",
-            )
-        ).first()
-        if key:
-            # Verify cluster was active in last 24hrs
-            cluster = db.query(EntityCluster).filter(
-                and_(
-                    EntityCluster.id == key.cluster_id,
-                    EntityCluster.last_post_at >= datetime.now(timezone.utc) - timedelta(hours=24),
-                )
-            ).first()
-            if cluster:
-                return key.cluster_id
+    # 2. Jaccard title similarity against recent clustered items
+    cluster_id = _match_by_title_similarity(db, item)
+    if cluster_id:
+        item.cluster_id = cluster_id
+        _update_cluster_on_link(db, cluster_id)
+        return
 
-    return None
+    # 3. No match — leave unclustered for Gemini batch pass
 
 
-def _match_by_title_similarity(db, post: Post) -> int | None:
-    """Find matching posts by Jaccard title similarity."""
+def _match_by_title_similarity(db, item: Item) -> int | None:
+    """Find matching cluster by Jaccard title similarity."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    recent_posts = db.query(Post).filter(
+    recent_items = db.query(Item).filter(
         and_(
-            Post.reddit_id != post.reddit_id,
-            Post.cluster_id.isnot(None),
-            Post.subreddit_id != post.subreddit_id,  # Different sub only
-            Post.first_seen_at >= cutoff,
+            Item.id != item.id,
+            Item.cluster_id.isnot(None),
+            Item.first_seen_at >= cutoff,
         )
     ).limit(200).all()
 
     best_score = 0.0
     best_cluster_id = None
 
-    for rp in recent_posts:
-        sim = _jaccard_similarity(post.title, rp.title)
+    for ri in recent_items:
+        sim = _jaccard_similarity(item.title, ri.title)
         if sim > best_score:
             best_score = sim
-            best_cluster_id = rp.cluster_id
+            best_cluster_id = ri.cluster_id
 
-        # Auto-match on proper noun overlap
-        post_proper = {w for w in post.title.split() if w and w[0].isupper() and len(w) > 1}
-        rp_proper = {w for w in rp.title.split() if w and w[0].isupper() and len(w) > 1}
-        common_proper = post_proper & rp_proper
-        # Skip common words
-        common_proper -= {"The", "This", "That", "My", "Our", "His", "Her",
-                          "It", "In", "At", "On", "Of", "An", "To", "So",
-                          "No", "Or", "If", "Up", "As", "By", "We", "He",
-                          "She", "Its", "All", "But", "For", "Not", "Are",
-                          "Was", "One", "Two", "Has", "Had", "Can", "Did",
-                          "Got", "New", "Old", "Big", "How", "Why", "Who",
-                          "Just", "Now", "Here", "Very", "Much", "Even",
-                          "More", "Most", "Some", "Any", "Each", "Every"}
+        # Auto-match on 2+ shared proper nouns (non-common words)
+        item_proper = {w for w in item.title.split() if w and w[0].isupper() and len(w) > 1}
+        ri_proper = {w for w in ri.title.split() if w and w[0].isupper() and len(w) > 1}
+        common_proper = (item_proper & ri_proper) - _COMMON_WORDS
         if len(common_proper) >= 2:
-            return rp.cluster_id
+            return ri.cluster_id
 
     if best_score >= JACCARD_THRESHOLD:
         return best_cluster_id
@@ -264,63 +132,119 @@ def _match_by_title_similarity(db, post: Post) -> int | None:
     return None
 
 
-def _match_by_phash(db, post: Post) -> int | None:
-    """Find matching posts by perceptual image hash."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    candidates = db.query(Post).filter(
-        and_(
-            Post.reddit_id != post.reddit_id,
-            Post.image_hash.isnot(None),
-            Post.cluster_id.isnot(None),
-            Post.first_seen_at >= cutoff,
-        )
-    ).limit(500).all()
-
-    for cand in candidates:
-        dist = _hamming_distance(post.image_hash, cand.image_hash)
-        if dist <= PHASH_THRESHOLD:
-            return cand.cluster_id
-        # Combined signal: loose hash + same species + some title similarity
-        if dist <= 16 and post.extracted_species and post.extracted_species == cand.extracted_species:
-            sim = _jaccard_similarity(post.title, cand.title)
-            if sim > 0.25:
-                return cand.cluster_id
-
-    return None
-
-
-def _update_cluster_on_link(db, cluster_id: int, post: Post):
-    """Atomically update cluster aggregates when linking a post."""
+def _update_cluster_on_link(db, cluster_id: int):
+    """Update cluster stats when linking an item."""
     db.execute(text("""
         UPDATE entity_clusters SET
-            post_count = post_count + 1,
-            total_score = total_score + :score,
-            total_comments = total_comments + :comments,
-            peak_anomaly = GREATEST(peak_anomaly, :anomaly),
-            last_post_at = GREATEST(last_post_at, :now)
+            mention_count = (SELECT COUNT(*) FROM items WHERE cluster_id = :cid),
+            source_count = (SELECT COUNT(DISTINCT source_type) FROM items WHERE cluster_id = :cid),
+            sub_count = (SELECT COUNT(DISTINCT extra->>'subreddit')
+                         FROM items WHERE cluster_id = :cid AND extra->>'subreddit' IS NOT NULL),
+            last_item_at = now()
         WHERE id = :cid
-    """), {
-        "score": post.current_score,
-        "comments": post.current_comments,
-        "anomaly": post.anomaly_score or 0,
-        "now": datetime.now(timezone.utc),
-        "cid": cluster_id,
-    })
+    """), {"cid": cluster_id})
 
-    # Add name as alias if new
-    if post.extracted_name:
-        existing = db.query(ClusterAlias).filter(
-            and_(
-                ClusterAlias.cluster_id == cluster_id,
-                ClusterAlias.alias == post.extracted_name.lower(),
+
+async def run_gemini_clustering(db):
+    """
+    Batch clustering pass — sends unclustered items to Gemini for semantic matching.
+    Runs every 5 minutes.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+
+    # Get unclustered items from last 24hrs
+    unclustered = db.query(Item).filter(
+        and_(
+            Item.cluster_id.is_(None),
+            Item.first_seen_at >= cutoff,
+        )
+    ).order_by(Item.first_seen_at.desc()).limit(30).all()
+
+    if not unclustered:
+        return
+
+    # Get existing active clusters
+    active_clusters = db.query(EntityCluster).filter(
+        EntityCluster.status == "active"
+    ).order_by(EntityCluster.mention_count.desc()).limit(50).all()
+
+    # Build inputs for Gemini
+    titles = [{
+        "id": item.id,
+        "title": item.title,
+        "source": item.source_type + (":" + (item.extra or {}).get("subreddit", "") if item.source_type == "reddit" else ""),
+    } for item in unclustered]
+
+    existing = [{
+        "id": c.id,
+        "entity_name": c.entity_name or "unnamed",
+        "entity_type": c.entity_type or "unknown",
+        "aliases": [a.alias for a in c.aliases],
+    } for c in active_clusters]
+
+    # Call Gemini
+    assignments = await gemini_client.cluster_titles(titles, existing)
+
+    if not assignments:
+        return
+
+    # Process assignments
+    item_map = {item.id: item for item in unclustered}
+
+    for assignment in assignments:
+        item_id = assignment.get("item_id")
+        cluster_id = assignment.get("cluster_id")
+        new_name = assignment.get("new_entity_name")
+        new_type = assignment.get("new_entity_type")
+
+        item = item_map.get(item_id)
+        if not item:
+            continue
+
+        if cluster_id:
+            # Assign to existing cluster
+            existing_cluster = db.query(EntityCluster).filter(
+                EntityCluster.id == cluster_id
+            ).first()
+            if existing_cluster:
+                item.cluster_id = cluster_id
+                _update_cluster_on_link(db, cluster_id)
+
+        elif new_name:
+            # Check if we already have a cluster with this name (Gemini might not know)
+            alias = db.query(ClusterAlias).filter(
+                ClusterAlias.alias == new_name.lower()
+            ).first()
+            if alias:
+                item.cluster_id = alias.cluster_id
+                _update_cluster_on_link(db, alias.cluster_id)
+                continue
+
+            # Create new cluster
+            cluster = EntityCluster(
+                entity_name=new_name,
+                entity_type=new_type,
+                mention_count=1,
+                source_count=1,
+                sub_count=1 if item.source_type == "reddit" else 0,
             )
-        ).first()
-        if not existing:
+            db.add(cluster)
+            db.flush()
+
+            item.cluster_id = cluster.id
+
+            # Add cluster key and alias
+            _add_cluster_key(db, cluster.id, "name", f"name:{_normalize_name(new_name)}")
             db.add(ClusterAlias(
-                cluster_id=cluster_id,
-                alias=post.extracted_name.lower(),
-                source="crosspost",
+                cluster_id=cluster.id,
+                alias=new_name.lower(),
+                source="gemini",
             ))
+
+            logger.info(f"New entity from Gemini: {new_name} ({new_type})")
+
+    db.flush()
+    logger.info(f"Gemini clustering: processed {len(assignments)} assignments")
 
 
 def _add_cluster_key(db, cluster_id: int, key_type: str, key_value: str):
@@ -339,84 +263,33 @@ def _add_cluster_key(db, cluster_id: int, key_type: str, key_value: str):
         ))
 
 
-async def check_cross_sub_alerts(db, cold_start_active: bool = False):
+def extract_ngram_entities(titles: list[str]) -> list[tuple[str, int]]:
     """
-    Check for cross-sub Level 3 triggers.
-    3+ posts about same entity across 3+ different subs within 24hrs,
-    each AS >= 2.0 and at least one AS >= 5.0.
+    N-gram frequency analysis — find repeated proper noun phrases across titles.
+    Returns list of (phrase, count) sorted by count desc.
+    Supplementary to Gemini — catches ~40% of viral moments.
     """
-    if cold_start_active:
-        return
+    # Extract 1-3 word proper noun phrases
+    phrase_counts: Counter = Counter()
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    active_clusters = db.query(EntityCluster).filter(
-        and_(
-            EntityCluster.status == "active",
-            EntityCluster.post_count >= CROSS_SUB_MIN_POSTS,
-            EntityCluster.alert_level < 3,  # Not already L3
-        )
-    ).all()
+    for title in titles:
+        words = title.split()
+        # Single proper nouns
+        for w in words:
+            if w and w[0].isupper() and len(w) > 2 and w not in _COMMON_WORDS:
+                phrase_counts[w] += 1
+        # Bigrams
+        for i in range(len(words) - 1):
+            w1, w2 = words[i], words[i + 1]
+            if (w1 and w1[0].isupper() and w2 and w2[0].isupper()
+                    and w1 not in _COMMON_WORDS and w2 not in _COMMON_WORDS):
+                phrase_counts[f"{w1} {w2}"] += 1
+        # Trigrams
+        for i in range(len(words) - 2):
+            w1, w2, w3 = words[i], words[i + 1], words[i + 2]
+            if (w1 and w1[0].isupper() and w3 and w3[0].isupper()
+                    and w1 not in _COMMON_WORDS):
+                phrase_counts[f"{w1} {w2} {w3}"] += 1
 
-    for cluster in active_clusters:
-        # Get recent posts for this cluster
-        posts = db.query(Post).filter(
-            and_(
-                Post.cluster_id == cluster.id,
-                Post.first_seen_at >= cutoff,
-                Post.anomaly_score >= CROSS_SUB_MIN_AS,
-            )
-        ).all()
-
-        if len(posts) < CROSS_SUB_MIN_POSTS:
-            continue
-
-        # Check distinct subreddits
-        sub_ids = {p.subreddit_id for p in posts}
-        if len(sub_ids) < 3:
-            continue
-
-        # Check at least one AS >= 5.0
-        max_as = max(p.anomaly_score for p in posts)
-        if max_as < CROSS_SUB_LEAD_AS:
-            continue
-
-        # Trigger Level 3!
-        lead_post = max(posts, key=lambda p: p.anomaly_score)
-        sub = db.query(Subreddit).filter(Subreddit.id == lead_post.subreddit_id).first()
-
-        lead_dict = {
-            "reddit_id": lead_post.reddit_id,
-            "subreddit": sub.name if sub else "unknown",
-            "title": lead_post.title,
-            "score": lead_post.current_score,
-            "anomaly_score": lead_post.anomaly_score,
-            "velocity": 0,
-        }
-        cluster_dict = {
-            "animal_name": cluster.animal_name,
-            "species": cluster.species,
-            "location": cluster.location,
-            "post_count": cluster.post_count,
-            "total_score": cluster.total_score,
-            "sub_count": len(sub_ids),
-            "top_archetype": cluster.top_archetype,
-        }
-
-        msg = telegram.format_level3(cluster_dict, lead_dict)
-        msg_id = await telegram.send_message(msg)
-
-        alert = Alert(
-            alert_type="cluster",
-            alert_level=3,
-            cluster_id=cluster.id,
-            post_id=lead_post.reddit_id,
-            message_text=msg,
-            telegram_msg_id=msg_id,
-        )
-        db.add(alert)
-        cluster.alert_level = 3
-        cluster.last_alert_at = datetime.now(timezone.utc)
-        db.flush()
-
-        logger.info(f"Cross-sub L3: {cluster.animal_name or cluster.species} "
-                     f"({len(posts)} posts / {len(sub_ids)} subs)")
+    # Filter to phrases appearing 2+ times
+    return [(phrase, count) for phrase, count in phrase_counts.most_common(20) if count >= 2]
