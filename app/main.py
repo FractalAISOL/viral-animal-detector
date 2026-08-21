@@ -26,9 +26,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _init_db_safe():
+    """Run schema.sql on startup using raw psycopg2."""
+    import os
+    schema_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "schema.sql")
+    if not os.path.exists(schema_path):
+        schema_path = "schema.sql"
+    if not os.path.exists(schema_path):
+        logger.warning("schema.sql not found, skipping DB init")
+        return
+    from app.config import DATABASE_URL
+    import psycopg2
+    with open(schema_path) as f:
+        schema = f.read()
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(schema)
+    cur.close()
+    conn.close()
+    logger.info("Database schema initialized")
+
+
 async def main():
     """Main entry point — runs the multi-source pipeline."""
     logger.info("Viral Moment Detector starting...")
+
+    # Initialize database on first run
+    try:
+        _init_db_safe()
+    except Exception as e:
+        logger.error(f"DB init error (may already exist): {e}")
 
     # Send startup notification
     await telegram.send_message(
