@@ -129,11 +129,14 @@ class Scorer:
         )
         db.add(history)
 
-        # YouTube validation for entities with enough mentions
+        # YouTube validation for entities with enough mentions (only once per entity)
         if (mention_counts["4h"] >= YT_VALIDATION_MIN_MENTIONS
-                and cluster.youtube_videos == 0
                 and cluster.entity_name):
-            await self._youtube_validate(db, cluster)
+            already_searched = db.query(YouTubeResult).filter(
+                YouTubeResult.cluster_id == cluster.id
+            ).first()
+            if not already_searched:
+                await self._youtube_validate(db, cluster)
 
         # Check alert thresholds
         if not self.cold_start_active:
