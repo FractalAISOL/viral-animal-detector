@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    create_engine, Column, Integer, BigInteger, SmallInteger, Text, Real,
+    create_engine, Column, Integer, BigInteger, SmallInteger, Text, Float,
     Boolean, DateTime, ForeignKey, CheckConstraint, UniqueConstraint, Index,
     text,
 )
@@ -84,8 +84,8 @@ class EntityCluster(Base):
     sub_count = Column(Integer, nullable=False, default=0)  # distinct subreddits
     youtube_views = Column(BigInteger, nullable=False, default=0)
     youtube_videos = Column(Integer, nullable=False, default=0)
-    momentum_score = Column(Real, nullable=False, default=0)
-    peak_momentum = Column(Real, nullable=False, default=0)
+    momentum_score = Column(Float, nullable=False, default=0)
+    peak_momentum = Column(Float, nullable=False, default=0)
     alert_level = Column(SmallInteger, nullable=False, default=0)
     last_alert_at = Column(DateTime(timezone=True))
     first_seen_at = Column(DateTime(timezone=True), nullable=False, default=now_utc)
@@ -136,10 +136,10 @@ class MomentumHistory(Base):
     id = Column(BigInteger, primary_key=True)
     cluster_id = Column(Integer, ForeignKey("entity_clusters.id", ondelete="CASCADE"), nullable=False)
     mention_count = Column(Integer, nullable=False)
-    mention_velocity = Column(Real)  # mentions/hour
+    mention_velocity = Column(Float)  # mentions/hour
     source_count = Column(Integer)
     sub_count = Column(Integer)
-    momentum_score = Column(Real)
+    momentum_score = Column(Float)
     recorded_at = Column(DateTime(timezone=True), nullable=False, default=now_utc)
 
 
