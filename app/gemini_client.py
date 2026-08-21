@@ -18,7 +18,7 @@ _last_reset_date = None
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-MODEL_NAME = "gemini-2.0-flash-lite"
+MODEL_NAME = "gemini-3.5-flash-lite"
 
 
 def _check_and_reset_daily():
